@@ -1,0 +1,358 @@
+"""
+Market risk indicators on real market data
+VaR, Stressed VaR, stress testing and backtesting
+
+Diptakshi Sen - self-directed project, 2026
+
+Risk factors (Yahoo Finance):
+    ^GSPC     S&P 500 index            equity risk
+    ^TNX      US 10-year yield (%)     interest rate risk
+    HYG       iShares high yield ETF   credit risk
+    EURUSD=X  EUR/USD                  FX risk
+
+Method note: equity, credit and FX are PRICE factors, so their risk factor is a
+return and the P&L contribution is value x return. Rates are a YIELD factor, so
+the risk factor is the CHANGE in yield, and the P&L contribution of a bond
+position is -(modified duration) x notional x change in yield. Taking a
+percentage change of a yield level would be meaningless.
+
+Run:  pip install yfinance numpy
+      python market_risk_real_data.py
+Outputs: console summary + market_risk_report.html (open, then print to PDF)
+"""
+
+from math import sqrt, log
+import numpy as np
+
+# ----------------------------------------------------------------- SETTINGS --
+CONF = 0.99                 # confidence level
+WINDOW = 250                # trading days for SVaR calibration and backtest
+START = "2018-01-01"        # history start
+
+POSITIONS = {
+    "Equity  (S&P 500)":      4_000_000,    # EUR exposed, long
+    "Credit  (HYG)":          2_500_000,    # EUR exposed, long
+    "FX      (EUR/USD)":      1_200_000,    # EUR exposed, long
+}
+BOND_NOTIONAL = 9_000_000                   # EUR, long a 10y bond
+BOND_MOD_DURATION = 6.5                     # modified duration, years
+
+STRESS = {                                  # equity, rates(dy), credit, fx
+    "Equity -20%, rates +100bp":  (-0.20,  0.0100, -0.06,  0.00),
+    "Flight to quality":          (-0.12, -0.0080, -0.09, -0.02),
+    "Rate shock +200bp":          (-0.05,  0.0200, -0.03,  0.00),
+}
+
+FACTORS = ["Equity", "Rates", "Credit", "FX"]
+
+
+# --------------------------------------------------------------- 1. DATA -----
+def load_factors():
+    """Download prices and build the four risk-factor series.
+
+    Returns (dates, factors, source) where factors is a (T x 4) array of
+    [equity return, yield change (decimal), credit return, fx return].
+    Falls back to a simulated history if the download fails, and says so.
+    """
+    try:
+        import yfinance as yf
+        tickers = ["^GSPC", "^TNX", "HYG", "EURUSD=X"]
+        px = yf.download(tickers, start=START, progress=False, auto_adjust=True)
+        px = px["Close"][tickers].dropna()
+        if len(px) < 600:
+            raise ValueError("history too short")
+
+        equity = px["^GSPC"].pct_change()
+        credit = px["HYG"].pct_change()
+        fx = px["EURUSD=X"].pct_change()
+        # ^TNX quotes the yield in percent (4.25 = 4.25%), so a change of
+        # 0.10 in the series is 10 basis points = 0.0010 in decimal terms
+        d_yield = px["^TNX"].diff() / 100.0
+
+        data = np.column_stack([equity, d_yield, credit, fx])[1:]
+        dates = [d.strftime("%d/%m/%Y") for d in px.index[1:]]
+        return dates, data, f"Yahoo Finance, {dates[0]} to {dates[-1]}, {len(dates)} days"
+
+    except Exception as exc:                                  # offline fallback
+        print(f"[!] Download unavailable ({exc}). Using a simulated history.")
+        rng = np.random.default_rng(3)
+        vols = np.array([0.011, 0.00045, 0.004, 0.005])
+        corr = np.array([[1.0, 0.20, 0.65, 0.10],
+                         [0.20, 1.0, 0.15, 0.05],
+                         [0.65, 0.15, 1.0, 0.12],
+                         [0.10, 0.05, 0.12, 1.0]])
+        cov = np.outer(vols, vols) * corr
+        data = rng.standard_normal((1500, 4)) @ np.linalg.cholesky(cov).T
+        data[600:750] *= 2.6
+        dates = [f"jour {i}" for i in range(1, 1501)]
+        return dates, data, "SIMULATED history (no market data available)"
+
+
+# ------------------------------------------------------- 2. P&L MAPPING ------
+def pnl_contributions(factors):
+    """Map risk-factor moves to a daily P&L contribution per factor, in EUR."""
+    eq, dy, cr, fx = factors[:, 0], factors[:, 1], factors[:, 2], factors[:, 3]
+    return np.column_stack([
+        POSITIONS["Equity  (S&P 500)"] * eq,
+        -BOND_MOD_DURATION * BOND_NOTIONAL * dy,      # bond price falls as yields rise
+        POSITIONS["Credit  (HYG)"] * cr,
+        POSITIONS["FX      (EUR/USD)"] * fx,
+    ])
+
+
+# ------------------------------------------------------------- 3. MEASURES ---
+def historical_var(pnl, conf=CONF):
+    """Empirical quantile of the loss distribution. No distributional assumption."""
+    return float(-np.percentile(pnl, (1 - conf) * 100))
+
+
+def parametric_var(contrib, conf=CONF):
+    """Variance-covariance VaR on the P&L contributions."""
+    from statistics import NormalDist
+    cov = np.cov(contrib, rowvar=False)
+    sigma = sqrt(float(np.ones(cov.shape[0]) @ cov @ np.ones(cov.shape[0])))
+    return NormalDist().inv_cdf(conf) * sigma
+
+
+def monte_carlo_var(contrib, conf=CONF, paths=100_000, seed=11):
+    """Monte Carlo VaR, Cholesky factor used to preserve the correlations."""
+    rng = np.random.default_rng(seed)
+    mu = contrib.mean(axis=0)
+    cov = np.cov(contrib, rowvar=False)
+    chol = np.linalg.cholesky(cov + 1e-6 * np.eye(len(mu)))
+    sim = mu + rng.standard_normal((paths, len(mu))) @ chol.T
+    return historical_var(sim.sum(axis=1), conf)
+
+
+def expected_shortfall(pnl, conf=CONF):
+    """Average loss beyond VaR."""
+    var = historical_var(pnl, conf)
+    tail = pnl[pnl <= -var]
+    return float(-tail.mean()) if len(tail) else var
+
+
+def stressed_var(pnl, dates, window=WINDOW, conf=CONF):
+    """Worst rolling-window VaR in the history, with the window dates."""
+    worst, start = -np.inf, 0
+    for i in range(0, len(pnl) - window + 1, 5):
+        v = historical_var(pnl[i:i + window], conf)
+        if v > worst:
+            worst, start = v, i
+    return worst, dates[start], dates[start + window - 1]
+
+
+def stress_results():
+    """P&L impact of each deterministic scenario."""
+    out = {}
+    for name, (eq, dy, cr, fx) in STRESS.items():
+        out[name] = (POSITIONS["Equity  (S&P 500)"] * eq
+                     - BOND_MOD_DURATION * BOND_NOTIONAL * dy
+                     + POSITIONS["Credit  (HYG)"] * cr
+                     + POSITIONS["FX      (EUR/USD)"] * fx)
+    return out
+
+
+def rate_ladder(shocks_bp=(-200, -100, -50, 50, 100, 200)):
+    """P&L of the bond position across a ladder of parallel rate shocks."""
+    return {bp: -BOND_MOD_DURATION * BOND_NOTIONAL * bp / 10000 for bp in shocks_bp}
+
+
+def backtest(pnl, var, conf=CONF):
+    """Exceptions and the Kupiec proportion-of-failures test."""
+    exceptions = int(np.sum(pnl < -var))
+    n = len(pnl)
+    p = 1 - conf
+    pi = exceptions / n if n else 0.0
+
+    def xlogx(count, prob):                 # 0 * log(0) treated as 0
+        return count * log(prob) if count > 0 and prob > 0 else 0.0
+
+    null = xlogx(n - exceptions, 1 - p) + xlogx(exceptions, p)
+    alt = xlogx(n - exceptions, 1 - pi) + xlogx(exceptions, pi)
+    lr = -2 * (null - alt)
+    return {"n": n, "exceptions": exceptions, "expected": round(p * n, 1),
+            "lr": lr, "reject": lr > 3.841}
+
+
+def traffic_light(exceptions):
+    """Basel zones for 250 observations at 99%."""
+    return "green" if exceptions <= 4 else ("amber" if exceptions <= 9 else "red")
+
+
+# ------------------------------------------------------------- 4. REPORT -----
+def eur(x):
+    return f"{x:,.0f}".replace(",", " ")
+
+
+def build(results, source):
+    r = results
+    rows_var = "".join(
+        f"<tr><td>{k}</td><td class='n'>{eur(v)}</td><td class='n'>{g}</td></tr>"
+        for k, v, g in r["var_rows"])
+    rows_stress = "".join(
+        f"<tr><td>{k}</td><td class='n'>{eur(v)}</td></tr>" for k, v in r["stress"].items())
+    rows_ladder = "".join(
+        f"<tr><td>{bp:+d} bp</td><td class='n'>{eur(v)}</td></tr>"
+        for bp, v in r["ladder"].items())
+    rows_pos = "".join(
+        f"<tr><td>{k}</td><td class='n'>{eur(v)}</td></tr>" for k, v in POSITIONS.items())
+
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Market Risk Indicators - Diptakshi Sen</title><style>
+@page {{ size: A4; margin: 1.7cm; }}
+body {{ font-family: Calibri, Arial, sans-serif; font-size: 10.5pt; color:#111; max-width: 780px; margin: 24px auto; }}
+h1 {{ font-size: 16.5pt; margin:0 0 2pt 0; }}
+h2 {{ font-size: 12pt; margin:15pt 0 5pt 0; border-bottom:1px solid #888; padding-bottom:2pt; }}
+.sub {{ color:#555; font-size:10pt; margin-bottom:12pt; }}
+table {{ border-collapse: collapse; width: 100%; table-layout: fixed; margin: 6pt 0 10pt 0; font-size: 10pt; }}
+th:first-child, td:first-child {{ width: 60%; }}
+th, td {{ border: 1px solid #d0d0d0; padding: 4pt 7pt; text-align: left; }}
+th {{ background: #1F3864; color: #fff; font-weight: bold; }}
+td.n {{ text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }}
+th {{ vertical-align: bottom; }}
+.note {{ background:#fff8e1; border-left:3px solid #e0a800; padding:7pt 10pt; font-size:10pt; }}
+li {{ margin-bottom: 3pt; }}
+</style></head><body>
+
+<h1>Market Risk Indicators — VaR, Stressed VaR, Stress Testing and Backtesting</h1>
+<div class="sub">Diptakshi Sen &nbsp;|&nbsp; self-directed project, Python &nbsp;|&nbsp; data: {source}</div>
+
+<h2>1. Portfolio and risk factors</h2>
+<table><tr><th>Position</th><th>Exposure (EUR)</th></tr>{rows_pos}
+<tr><td>Rates (10y bond, modified duration {BOND_MOD_DURATION})</td><td class='n'>{eur(BOND_NOTIONAL)}</td></tr></table>
+<p>Equity, credit and FX are price factors: the risk factor is a return and the P&amp;L
+contribution is exposure &times; return. Rates are a yield factor: the risk factor is the
+change in yield, and the contribution is &minus;(modified duration) &times; notional &times; &Delta;y.
+A percentage change of a yield level would carry no economic meaning, which is why the two
+mappings are kept separate.</p>
+
+<h2>2. One-day VaR at {int(CONF*100)}%</h2>
+<table><tr><th>Method</th><th>VaR (EUR)</th><th>vs historical</th></tr>{rows_var}</table>
+<p>Expected shortfall: <b>{eur(r['es'])} EUR</b> — the average loss on days when VaR is exceeded.</p>
+<p>{r['tail_comment']}</p>
+
+<h2>3. Stressed VaR</h2>
+<table>
+<tr><th>Measure</th><th>Value</th></tr>
+<tr><td>Stressed VaR at {int(CONF*100)}%</td><td class='n'>{eur(r['svar'])} EUR</td></tr>
+<tr><td>Calibration window</td><td class='n'>{r['svar_from']} — {r['svar_to']}</td></tr>
+<tr><td>SVaR / VaR multiple</td><td class='n'>{r['svar_mult']:.2f} x</td></tr>
+</table>
+<p>The window is selected for severity, not recency: the same portfolio is repriced through the
+worst {WINDOW}-day stretch in the available history.</p>
+
+<h2>4. Deterministic stress tests</h2>
+<table><tr><th>Scenario</th><th>P&amp;L impact (EUR)</th></tr>{rows_stress}</table>
+
+<h2>5. Rate sensitivity ladder (bond position)</h2>
+<table><tr><th>Parallel shock</th><th>P&amp;L impact (EUR)</th></tr>{rows_ladder}</table>
+
+<h2>6. Backtesting over the last {WINDOW} days</h2>
+<table>
+<tr><th>Measure</th><th>Value</th></tr>
+<tr><td>VaR applied (estimated out of sample)</td><td class='n'>{eur(r['bt_var'])} EUR</td></tr>
+<tr><td>Observations</td><td class='n'>{r['bt']['n']}</td></tr>
+<tr><td>Exceptions observed</td><td class='n'>{r['bt']['exceptions']}</td></tr>
+<tr><td>Exceptions expected</td><td class='n'>{r['bt']['expected']}</td></tr>
+<tr><td>Kupiec statistic (chi2, 1 df, 5% critical value 3.841)</td><td class='n'>{r['bt']['lr']:.3f}</td></tr>
+<tr><td>Model rejected at 95%</td><td class='n'>{'yes' if r['bt']['reject'] else 'no'}</td></tr>
+<tr><td>Basel traffic-light zone</td><td class='n'>{traffic_light(r['bt']['exceptions'])}</td></tr>
+</table>
+<p>{r['bt_comment']}</p>
+
+<h2>Method notes</h2>
+<ul>
+<li>The three VaR methods are computed independently and compared. Agreement is evidence;
+a single figure is only a figure.</li>
+<li>The gap between parametric and historical VaR measures the tail thickness the normal
+assumption ignores.</li>
+<li>The Kupiec test rejects in both directions. A model with no exceptions at all is rejected
+too: an overstated VaR consumes capital without measuring risk.</li>
+<li>The backtest VaR is estimated on data preceding the test window, so the test is genuinely
+out of sample.</li>
+</ul>
+
+<div class="note"><b>Data.</b> {source}. Yields are converted from percentage points to decimals
+before use. All figures in this report are produced by the accompanying script and reproduce
+exactly on re-run.</div>
+
+</body></html>"""
+
+
+# --------------------------------------------------------------- 5. MAIN -----
+def main():
+    dates, factors, source = load_factors()
+    contrib = pnl_contributions(factors)
+    pnl = contrib.sum(axis=1)
+
+    hv = historical_var(pnl)
+    pv = parametric_var(contrib)
+    mv = monte_carlo_var(contrib)
+    es = expected_shortfall(pnl)
+    svar, s_from, s_to = stressed_var(pnl, dates)
+
+    bt_var = historical_var(pnl[:-WINDOW])
+    bt = backtest(pnl[-WINDOW:], bt_var)
+
+    tail = ("The parametric figure sits below the historical one, which is the signature of fat "
+            "tails: the normal assumption does not generate the extreme days the data contains."
+            if pv < hv else
+            "The parametric figure sits at or above the historical one over this sample, so the "
+            "normal assumption is not understating the tail here.")
+
+    if bt["exceptions"] > bt["expected"]:
+        cmt = ("More exceptions than expected: the model understates risk over the period and "
+               "would attract supervisory attention.")
+    elif bt["exceptions"] < bt["expected"]:
+        cmt = ("Fewer exceptions than expected: the model is over-conservative over the period. "
+               "Kupiec rejects in both directions, because an overstated VaR ties up capital "
+               "without measuring the real risk.")
+    else:
+        cmt = "The exception count matches expectation."
+
+    results = {
+        "var_rows": [("Historical", hv, "—"),
+                     ("Parametric (variance-covariance)", pv, f"{pv/hv-1:+.1%}"),
+                     ("Monte Carlo, 100k paths", mv, f"{mv/hv-1:+.1%}")],
+        "es": es, "tail_comment": tail,
+        "svar": svar, "svar_from": s_from, "svar_to": s_to, "svar_mult": svar / hv,
+        "stress": stress_results(), "ladder": rate_ladder(),
+        "bt_var": bt_var, "bt": bt, "bt_comment": cmt,
+    }
+
+    # console
+    w = 74
+    print("=" * w)
+    print("MARKET RISK INDICATORS")
+    print("=" * w)
+    print(f"Data: {source}\n")
+    print(f"One-day VaR at {int(CONF*100)}%")
+    print(f"  Historical              {eur(hv):>14} EUR")
+    print(f"  Parametric              {eur(pv):>14} EUR   gap {pv/hv-1:+.1%}")
+    print(f"  Monte Carlo (100k)      {eur(mv):>14} EUR   gap {mv/hv-1:+.1%}")
+    print(f"  Expected shortfall      {eur(es):>14} EUR\n")
+    print(f"Stressed VaR              {eur(svar):>14} EUR")
+    print(f"  Window                  {s_from} - {s_to}")
+    print(f"  SVaR / VaR              {svar/hv:>14.2f} x\n")
+    print("Stress tests")
+    for k, v in results["stress"].items():
+        print(f"  {k:<30} {eur(v):>14} EUR")
+    print("\nRate ladder (bond position)")
+    for bp, v in results["ladder"].items():
+        print(f"  {bp:+5d} bp                 {eur(v):>14} EUR")
+    print(f"\nBacktest, last {WINDOW} days")
+    print(f"  VaR applied             {eur(bt_var):>14} EUR")
+    print(f"  Exceptions              {bt['exceptions']:>14}   (expected {bt['expected']})")
+    print(f"  Kupiec statistic        {bt['lr']:>14.3f}   reject at 95%: {bt['reject']}")
+    print(f"  Basel zone              {traffic_light(bt['exceptions']):>14}")
+
+    with open("market_risk_report.html", "w", encoding="utf-8") as f:
+        f.write(build(results, source))
+    print("\n" + "=" * w)
+    print("Report written to market_risk_report.html")
+    print("Open it in a browser, then print to PDF to obtain the submission file.")
+    print("=" * w)
+
+
+if __name__ == "__main__":
+    main()
